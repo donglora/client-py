@@ -1,0 +1,25 @@
+[project]
+name = "donglora"
+version = "0.1.0"
+description = "DongLoRa host library — talk LoRa from Python over USB"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Stephen Waits" }]
+keywords = ["lora", "radio", "usb", "embedded"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "cobs",
+    "pyserial",
+]
+
+[project.optional-dependencies]
+meshcore = ["pycryptodome", "pynacl"]
+orac = ["pycryptodome", "pynacl", "anthropic"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
