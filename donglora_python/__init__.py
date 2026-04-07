@@ -19,9 +19,17 @@ from cobs import cobs
 
 USB_VID_PID = "1209:5741"
 
+# Known USB-UART bridge VID:PIDs found on some board revisions.
+BRIDGE_VID_PIDS = {"10c4:ea60", "1a86:55d4", "1a86:7523", "0403:6001"}
+
 
 def find_port() -> str | None:
-    """Find the DongLoRa serial port by USB VID:PID."""
+    """Find the DongLoRa serial port by USB VID:PID.
+
+    Checks for native USB CDC-ACM first (1209:5741), then falls back to
+    known USB-UART bridge chips found on some board revisions.
+    """
+    bridge_match = None
     for path in sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*")):
         try:
             result = subprocess.run(
@@ -33,11 +41,16 @@ def find_port() -> str | None:
             )
             vid = props.get("ID_VENDOR_ID", "").lower()
             pid = props.get("ID_MODEL_ID", "").lower()
-            if f"{vid}:{pid}" == USB_VID_PID:
+            vid_pid = f"{vid}:{pid}"
+            if vid_pid == USB_VID_PID:
                 return path
+            if bridge_match is None and vid_pid in BRIDGE_VID_PIDS:
+                bridge_match = path
         except Exception:
             continue
-    ports = sorted(glob.glob("/dev/ttyACM*"))
+    if bridge_match is not None:
+        return bridge_match
+    ports = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
     return ports[0] if ports else None
 
 
@@ -345,7 +358,7 @@ def connect(port: str | None = None, timeout: float = 2.0) -> serial.Serial | Mu
         # No mux available — direct USB serial
     if port is None:
         port = wait_for_device()
-    ser = serial.Serial(port, timeout=timeout)
+    ser = serial.Serial(port, baudrate=115200, timeout=timeout)
     ser.reset_input_buffer()
     return ser
 

@@ -1,5 +1,5 @@
 [project]
-name = "donglora"
+name = "donglora-python"
 version = "0.1.0"
 description = "DongLoRa host library — talk LoRa from Python over USB"
 license = "MIT"
