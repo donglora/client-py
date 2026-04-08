@@ -1,13 +1,20 @@
 [project]
-name = "donglora-python"
-version = "0.1.0"
+name = "donglora"
+version = "0.2.0"
 description = "DongLoRa host library — talk LoRa from Python over USB"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Stephen Waits" }]
-keywords = ["lora", "radio", "usb", "embedded"]
+readme = "README.md"
+authors = [{ name = "Stephen Waits", email = "steve@waits.net" }]
+keywords = ["lora", "radio", "usb", "embedded", "serial"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Communications :: Ham Radio",
     "Topic :: System :: Hardware",
 ]
@@ -20,9 +27,27 @@ dependencies = [
 meshcore = ["pycryptodome", "pynacl"]
 orac = ["pycryptodome", "pynacl", "anthropic"]
 
+[project.urls]
+Repository = "https://github.com/donglora/client-py"
+Homepage = "https://github.com/donglora/client-py"
+
 [dependency-groups]
-dev = ["ruff"]
+dev = ["ruff", "pytest", "pytest-cov"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "ARG", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["donglora"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

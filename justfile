@@ -6,8 +6,8 @@ default: check
 _ensure_tools:
     @mise trust --yes . 2>/dev/null; mise install --quiet
 
-# Run all checks (fmt, lint)
-check: fmt-check lint
+# Run all checks (fmt, lint, test)
+check: fmt-check lint test
 
 # Format code
 fmt: _ensure_tools
@@ -20,3 +20,7 @@ fmt-check: _ensure_tools
 # Lint
 lint: _ensure_tools
     @uv run ruff check .
+
+# Run tests
+test: _ensure_tools
+    @uv run pytest -v
