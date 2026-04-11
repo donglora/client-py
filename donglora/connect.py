@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 from typing import Any
 
 import serial
@@ -53,6 +54,11 @@ def _find_mux_socket() -> str | None:
             return p
     p = "/tmp/donglora-mux.sock"
     return p if os.path.exists(p) else None
+
+
+_used_mux = False
+"""Set once this process connects via mux.  All future connect() calls
+will only try mux, never fall through to direct serial."""
 
 
 def _try_tcp_mux(addr: str, timeout: float) -> MuxConnection | None:
@@ -104,7 +110,7 @@ def mux_tcp_connect(host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> M
 def connect(port: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
     """Auto-detect and connect to a DongLoRa device.
 
-    Priority:
+    Priority (first connection):
 
     1. ``DONGLORA_MUX_TCP`` env var -> TCP mux connection
     2. Unix socket mux (if socket file exists)
@@ -112,12 +118,12 @@ def connect(port: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
 
     If *port* is given, skips mux detection and connects directly.
 
-    .. note::
-
-       If a mux socket file exists, this function **commits** to the mux
-       and will raise on failure rather than falling through to USB serial.
-       This prevents port-stealing race conditions (matches Rust v0.2.1).
+    Once a mux connection succeeds, all future calls in this process only
+    try the mux (waiting for it to reappear if necessary).  This prevents
+    clients from stealing the serial port during a mux restart.
     """
+    global _used_mux
+
     # Explicit port — go direct
     if port is not None:
         log.debug("opening serial port %s", port)
@@ -126,21 +132,33 @@ def connect(port: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
         validate(ser)
         return ser
 
+    # Previously connected via mux — stay on mux, wait if necessary
+    if _used_mux:
+        mux_path = default_socket_path()
+        while not os.path.exists(mux_path):
+            log.info("Waiting for mux at %s ...", mux_path)
+            time.sleep(0.5)
+        conn = mux_connect(mux_path, timeout)
+        return conn
+
     # Try TCP mux via environment variable
     tcp = os.environ.get("DONGLORA_MUX_TCP")
     if tcp:
         conn = _try_tcp_mux(tcp, timeout)
         if conn is not None:
             log.debug("connected to TCP mux at %s", tcp)
+            _used_mux = True
             return conn
 
     # Try Unix socket mux — commit if socket exists (no fall-through)
     sock_path = _find_mux_socket()
     if sock_path is not None:
         log.debug("mux socket found at %s — connecting via mux only", sock_path)
-        return mux_connect(sock_path, timeout)
+        conn = mux_connect(sock_path, timeout)
+        _used_mux = True
+        return conn
 
-    # Direct USB serial — only reached when no mux socket exists at all
+    # No mux found on first attempt — direct USB serial
     port_path = find_port()
     if port_path is None:
         port_path = wait_for_device()
@@ -187,22 +205,34 @@ def try_connect(timeout: float = DEFAULT_TIMEOUT) -> Any:
     Runs the same fallback chain (TCP mux, Unix socket mux, direct USB
     serial) but uses a single non-blocking scan instead of polling
     indefinitely for a USB device.  Raises if nothing is found.
+
+    If a previous call connected via mux, only tries mux (raises if
+    the mux socket is not currently available).
     """
+    global _used_mux
+
+    # Previously connected via mux — only try mux
+    if _used_mux:
+        return mux_connect(None, timeout)
+
     # Try TCP mux via environment variable
     tcp = os.environ.get("DONGLORA_MUX_TCP")
     if tcp:
         conn = _try_tcp_mux(tcp, timeout)
         if conn is not None:
             log.debug("connected to TCP mux at %s", tcp)
+            _used_mux = True
             return conn
 
     # Try Unix socket mux — commit if socket exists
     sock_path = _find_mux_socket()
     if sock_path is not None:
         log.debug("mux socket found at %s — connecting via mux only", sock_path)
-        return mux_connect(sock_path, timeout)
+        conn = mux_connect(sock_path, timeout)
+        _used_mux = True
+        return conn
 
-    # Direct USB serial — single non-blocking scan
+    # No mux found on first attempt — direct USB serial (single non-blocking scan)
     port_path = find_port()
     if port_path is None:
         raise FileNotFoundError("no DongLoRa device found (no mux, no USB device)")
