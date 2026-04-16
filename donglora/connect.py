@@ -1,9 +1,16 @@
-"""Connection auto-detection and mux client helpers.
+"""Auto-detect and connect to a DongLoRa device.
 
-Mirrors the Rust client's ``connect.rs``.  The :func:`connect` function
-tries mux connections first (TCP via env var, then Unix socket), falling
-back to direct USB serial.  This matches the Rust client's ``connect()``
-behaviour.
+``connect()`` is the "60-seconds-to-hacking" entry point. In its zero-argument
+form it:
+
+1. Finds a DongLoRa USB device (or mux socket if one is available).
+2. Opens the transport at 115200 baud.
+3. Sends ``GET_INFO`` to confirm we're talking DongLoRa Protocol v2.
+4. Applies a sensible default :class:`LoRaConfig` via ``SET_CONFIG``.
+5. Spawns a keepalive thread to keep the session alive.
+6. Returns a :class:`Dongle` ready for ``.tx()`` / ``.rx()``.
+
+Every step is overrideable via keyword arguments. See ``connect``'s docstring.
 """
 
 from __future__ import annotations
@@ -16,23 +23,23 @@ from typing import Any
 
 import serial
 
-from donglora.client import validate
 from donglora.discovery import find_port, wait_for_device
+from donglora.dongle import Dongle
+from donglora.errors import DongloraError
+from donglora.info import Info
+from donglora.modulation import LoRaConfig, Modulation
+from donglora.session import Session
 from donglora.transport import MuxConnection
 
-log = logging.getLogger("donglora")
+log = logging.getLogger("donglora.connect")
 
 DEFAULT_TIMEOUT: float = 2.0
-"""Default read timeout for connections (seconds)."""
+"""Default transport read timeout (seconds). This is the *poll* interval
+— overall command deadlines are per-call kwargs on the Dongle API."""
 
 
 def default_socket_path() -> str:
-    """Resolve the mux socket path in priority order.
-
-    1. ``$DONGLORA_MUX`` environment variable
-    2. ``$XDG_RUNTIME_DIR/donglora/mux.sock``
-    3. ``/tmp/donglora-mux.sock``
-    """
+    """Resolve the mux socket path in priority order."""
     env = os.environ.get("DONGLORA_MUX")
     if env:
         return env
@@ -43,7 +50,6 @@ def default_socket_path() -> str:
 
 
 def _find_mux_socket() -> str | None:
-    """Find an existing mux socket path, or ``None`` if no socket file exists."""
     env = os.environ.get("DONGLORA_MUX")
     if env:
         return env if os.path.exists(env) else None
@@ -57,15 +63,9 @@ def _find_mux_socket() -> str | None:
 
 
 _used_mux = False
-"""Set once this process connects via mux.  All future connect() calls
-will only try mux, never fall through to direct serial."""
 
 
 def _try_tcp_mux(addr: str, timeout: float) -> MuxConnection | None:
-    """Try to connect to a TCP mux at *addr* (``[host:]port``).
-
-    Returns ``None`` on failure instead of raising.
-    """
     if ":" in addr:
         host, _, port_str = addr.rpartition(":")
         host = host or "localhost"
@@ -77,71 +77,35 @@ def _try_tcp_mux(addr: str, timeout: float) -> MuxConnection | None:
     except ValueError:
         return None
     try:
-        return mux_tcp_connect(host, port, timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+        return MuxConnection(sock, timeout)
     except (ConnectionRefusedError, OSError):
         return None
 
 
-# ── Public connection functions ───────────────────────────────────
+def _open_transport(port: str | None, timeout: float) -> Any:
+    """Bottom-level transport opener. Returns a serial/socket-like object.
 
-
-def mux_connect(path: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> MuxConnection:
-    """Connect to the DongLoRa mux daemon via Unix domain socket."""
-    if path is None:
-        path = _find_mux_socket()
-    if path is None:
-        raise FileNotFoundError("no mux socket found")
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(path)
-    conn = MuxConnection(sock, timeout)
-    validate(conn)
-    return conn
-
-
-def mux_tcp_connect(host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> MuxConnection:
-    """Connect to the DongLoRa mux daemon via TCP."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((host, port))
-    conn = MuxConnection(sock, timeout)
-    validate(conn)
-    return conn
-
-
-def connect(port: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
-    """Auto-detect and connect to a DongLoRa device.
-
-    Priority (first connection):
-
-    1. ``DONGLORA_MUX_TCP`` env var -> TCP mux connection
-    2. Unix socket mux (if socket file exists)
-    3. Direct USB serial (auto-detect by VID:PID, blocks until device appears)
-
-    If *port* is given, skips mux detection and connects directly.
-
-    Once a mux connection succeeds, all future calls in this process only
-    try the mux (waiting for it to reappear if necessary).  This prevents
-    clients from stealing the serial port during a mux restart.
+    Priority: explicit port → sticky mux → TCP mux env → Unix mux socket → USB auto-detect.
     """
     global _used_mux
 
-    # Explicit port — go direct
     if port is not None:
         log.debug("opening serial port %s", port)
         ser = serial.Serial(port, baudrate=115200, timeout=timeout)
         ser.reset_input_buffer()
-        validate(ser)
         return ser
 
-    # Previously connected via mux — stay on mux, wait if necessary
     if _used_mux:
         mux_path = default_socket_path()
         while not os.path.exists(mux_path):
             log.info("Waiting for mux at %s ...", mux_path)
             time.sleep(0.5)
-        conn = mux_connect(mux_path, timeout)
-        return conn
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(mux_path)
+        return MuxConnection(sock, timeout)
 
-    # Try TCP mux via environment variable
     tcp = os.environ.get("DONGLORA_MUX_TCP")
     if tcp:
         conn = _try_tcp_mux(tcp, timeout)
@@ -150,94 +114,211 @@ def connect(port: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
             _used_mux = True
             return conn
 
-    # Try Unix socket mux — commit if socket exists (no fall-through)
     sock_path = _find_mux_socket()
     if sock_path is not None:
-        log.debug("mux socket found at %s — connecting via mux only", sock_path)
-        conn = mux_connect(sock_path, timeout)
+        log.debug("mux socket found at %s", sock_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
         _used_mux = True
-        return conn
+        return MuxConnection(sock, timeout)
 
-    # No mux found on first attempt — direct USB serial
     port_path = find_port()
     if port_path is None:
         port_path = wait_for_device()
     log.debug("opening serial port %s", port_path)
     ser = serial.Serial(port_path, baudrate=115200, timeout=timeout)
     ser.reset_input_buffer()
-    validate(ser)
     return ser
 
 
-def connect_default() -> Any:
-    """Connect with the default timeout.  Convenience wrapper for ``connect(None)``."""
-    return connect(timeout=DEFAULT_TIMEOUT)
+def connect(
+    port: str | None = None,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    config: Modulation | None = None,
+    auto_configure: bool = True,
+    keepalive: bool = True,
+) -> Dongle:
+    """Connect to a DongLoRa device and return a ready-to-use :class:`Dongle`.
 
+    The default (zero-argument) invocation:
 
-def connect_mux_auto(timeout: float = DEFAULT_TIMEOUT) -> Any:
-    """Connect to a mux daemon only (TCP via env var, then Unix socket).
+    * Auto-discovers a USB device (or mux socket).
+    * Sends ``GET_INFO`` to confirm DongLoRa Protocol v2.
+    * Applies ``LoRaConfig.default()`` (EU868 / SF7 / BW125 / CR4/5).
+    * Starts a background keepalive thread.
 
-    Unlike :func:`connect`, this **never** falls back to direct USB serial.
-    Returns an error if no mux is reachable — the caller can retry with
-    backoff.
+    Parameters
+    ----------
+    port
+        Explicit serial device path. Skips auto-discovery.
+    timeout
+        Transport read timeout (polling interval). Default 2 s.
+    config
+        Modulation to apply at connect-time. Default:
+        :meth:`LoRaConfig.default`. Pass ``None`` with
+        ``auto_configure=False`` to skip configuration entirely.
+    auto_configure
+        If False, skip the ``SET_CONFIG`` step. The caller is then
+        responsible for calling :meth:`Dongle.set_config` before TX/RX.
+    keepalive
+        If False, skip the keepalive daemon thread. The caller is
+        responsible for periodic :meth:`Dongle.ping` calls to stay
+        under the 1 s inactivity timer.
 
-    This is the Python equivalent of the Rust client's "sticky mux" behaviour:
-    once you decide to use the mux, you stay on the mux.
     """
-    # Try TCP mux via environment variable
+
+    def _open_and_init() -> tuple[Session, Info, Modulation | None]:
+        """Open the transport, bring up a Session, and verify+configure.
+
+        Used for both the initial connect and any later transparent
+        reconnect driven by :meth:`Dongle._recover_session`. Respects
+        the sticky-mux state at call time — so a mux-first first call
+        followed by a reconnect will stay on mux even if USB came back.
+        """
+        transport = _open_transport(port, timeout)
+        session = Session(transport)
+        try:
+            info = session.get_info(timeout=max(timeout, 2.0))
+        except DongloraError:
+            session.close()
+            raise
+        if not isinstance(info, Info):
+            session.close()
+            raise DongloraError(f"GET_INFO returned unexpected payload: {info!r}")
+        if info.proto_major != 1:
+            session.close()
+            raise DongloraError(
+                f"device speaks DongLoRa Protocol v{info.proto_major}.{info.proto_minor}; "
+                "this client requires v1.x",
+            )
+
+        applied: Modulation | None = None
+        if auto_configure:
+            applied = config if config is not None else LoRaConfig.default()
+            try:
+                session.set_config(applied, timeout=max(timeout, 2.0))
+            except DongloraError:
+                session.close()
+                raise
+        return session, info, applied
+
+    session, info, applied = _open_and_init()
+    return Dongle(
+        session,
+        info,
+        applied_config=applied,
+        keepalive=keepalive,
+        _reopener=_open_and_init,
+    )
+
+
+def connect_default() -> Dongle:
+    """Convenience wrapper for ``connect()`` with all defaults."""
+    return connect()
+
+
+def connect_mux_auto(timeout: float = DEFAULT_TIMEOUT) -> Dongle:
+    """Connect via mux only — never falls through to direct USB serial.
+
+    Sets the sticky-mux flag on success so any later :func:`connect`
+    call also stays on the mux.
+    """
+    global _used_mux
     tcp = os.environ.get("DONGLORA_MUX_TCP")
     if tcp:
         conn = _try_tcp_mux(tcp, timeout)
         if conn is not None:
-            log.debug("connected to TCP mux at %s", tcp)
-            return conn
+            _used_mux = True
+            return _session_on(conn)
 
-    # Try Unix socket mux
     sock_path = _find_mux_socket()
     if sock_path is None:
         raise FileNotFoundError("no mux socket found")
-    return mux_connect(sock_path, timeout)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    _used_mux = True
+    return _session_on(MuxConnection(sock, timeout))
 
 
-def try_connect(timeout: float = DEFAULT_TIMEOUT) -> Any:
-    """Like :func:`connect` but non-blocking when no USB device is present.
-
-    Runs the same fallback chain (TCP mux, Unix socket mux, direct USB
-    serial) but uses a single non-blocking scan instead of polling
-    indefinitely for a USB device.  Raises if nothing is found.
-
-    If a previous call connected via mux, only tries mux (raises if
-    the mux socket is not currently available).
-    """
+def try_connect(timeout: float = DEFAULT_TIMEOUT) -> Dongle:
+    """Like :func:`connect` but single-scan USB (no blocking wait)."""
     global _used_mux
-
-    # Previously connected via mux — only try mux
     if _used_mux:
-        return mux_connect(None, timeout)
+        return connect_mux_auto(timeout)
 
-    # Try TCP mux via environment variable
     tcp = os.environ.get("DONGLORA_MUX_TCP")
     if tcp:
         conn = _try_tcp_mux(tcp, timeout)
         if conn is not None:
-            log.debug("connected to TCP mux at %s", tcp)
             _used_mux = True
-            return conn
+            return _session_on(conn)
 
-    # Try Unix socket mux — commit if socket exists
     sock_path = _find_mux_socket()
     if sock_path is not None:
-        log.debug("mux socket found at %s — connecting via mux only", sock_path)
-        conn = mux_connect(sock_path, timeout)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
         _used_mux = True
-        return conn
+        return _session_on(MuxConnection(sock, timeout))
 
-    # No mux found on first attempt — direct USB serial (single non-blocking scan)
     port_path = find_port()
     if port_path is None:
         raise FileNotFoundError("no DongLoRa device found (no mux, no USB device)")
-    log.debug("opening serial port %s", port_path)
     ser = serial.Serial(port_path, baudrate=115200, timeout=timeout)
     ser.reset_input_buffer()
-    validate(ser)
-    return ser
+    return _session_on(ser)
+
+
+def mux_connect(path: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> Dongle:
+    """Connect to the mux daemon via Unix domain socket.
+
+    Sets the sticky-mux flag on success so any later :func:`connect`
+    call also stays on the mux.
+    """
+    global _used_mux
+    if path is None:
+        path = _find_mux_socket()
+    if path is None:
+        raise FileNotFoundError("no mux socket found")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    _used_mux = True
+    return _session_on(MuxConnection(sock, timeout))
+
+
+def mux_tcp_connect(host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> Dongle:
+    """Connect to the mux daemon via TCP.
+
+    Sets the sticky-mux flag on success so any later :func:`connect`
+    call also stays on the mux.
+    """
+    global _used_mux
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    _used_mux = True
+    return _session_on(MuxConnection(sock, timeout))
+
+
+def _session_on(transport: Any) -> Dongle:
+    """Bring up a :class:`Dongle` on an already-open transport."""
+    session = Session(transport)
+    try:
+        info = session.get_info()
+    except DongloraError:
+        session.close()
+        raise
+    if not isinstance(info, Info):
+        session.close()
+        raise DongloraError(f"GET_INFO returned unexpected payload: {info!r}")
+    if info.proto_major != 1:
+        session.close()
+        raise DongloraError(
+            f"device speaks DongLoRa Protocol v{info.proto_major}.{info.proto_minor}; this client requires v1.x",
+        )
+    applied = LoRaConfig.default()
+    try:
+        session.set_config(applied)
+    except DongloraError:
+        session.close()
+        raise
+    return Dongle(session, info, applied_config=applied, keepalive=True)

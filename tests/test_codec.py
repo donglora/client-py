@@ -1,12 +1,13 @@
-"""Tests for donglora.codec — COBS framing."""
+"""COBS helper tests — the thin re-export layer.
+
+Frame-level codec tests live in ``test_frame.py``.
+"""
 
 from __future__ import annotations
 
-from io import BytesIO
-
 from cobs import cobs
 
-from donglora.codec import cobs_encode, read_frame
+from donglora.codec import cobs_encode
 
 
 class TestCobsEncode:
@@ -34,42 +35,3 @@ class TestCobsEncode:
             encoded = cobs_encode(data)
             decoded = cobs.decode(encoded[:-1])
             assert decoded == data
-
-
-class _MockSerial:
-    """Minimal mock that behaves like serial.Serial for read_frame."""
-
-    def __init__(self, data: bytes) -> None:
-        self._stream = BytesIO(data)
-
-    def read(self, n: int = 1) -> bytes:
-        return self._stream.read(n)
-
-
-class TestReadFrame:
-    def test_basic(self) -> None:
-        data = b"hello"
-        frame = cobs_encode(data)
-        result = read_frame(_MockSerial(frame))
-        assert result == data
-
-    def test_timeout(self) -> None:
-        result = read_frame(_MockSerial(b""))
-        assert result is None
-
-    def test_empty_frame(self) -> None:
-        result = read_frame(_MockSerial(b"\x00"))
-        assert result is None
-
-    def test_corrupt_frame(self) -> None:
-        result = read_frame(_MockSerial(b"\xff\x00"))
-        # cobs.decode of [0xff] may or may not raise — just verify we get bytes or None
-        assert result is None or isinstance(result, bytes)
-
-    def test_multiple_frames(self) -> None:
-        frame1 = cobs_encode(b"first")
-        frame2 = cobs_encode(b"second")
-        mock = _MockSerial(frame1 + frame2)
-        assert read_frame(mock) == b"first"
-        assert read_frame(mock) == b"second"
-        assert read_frame(mock) is None

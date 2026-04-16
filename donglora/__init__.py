@@ -1,30 +1,48 @@
-"""DongLoRa host library — connect, configure, send/receive LoRa packets.
-
-Implements the DongLoRa USB protocol (COBS-framed fixed-size LE).
-See firmware/PROTOCOL.md for the full specification.
+"""DongLoRa host library — talk LoRa from Python in three lines.
 
 Quick start::
 
     import donglora as dl
 
-    ser = dl.connect()
-    dl.send(ser, "SetConfig", config=dl.DEFAULT_CONFIG)
-    dl.send(ser, "StartRx")
+    d = dl.connect()                  # auto-discover, auto-configure, auto-keepalive
+    d.tx(b"Hello")                    # blocks until TX_DONE
+    for pkt in d.rx():                # continuous receive
+        print(pkt.rssi_dbm, pkt.data)
 
-    while True:
-        pkt = dl.recv(ser)
-        if pkt:
-            print(pkt["rssi"], pkt["payload"].hex())
+For trivial scripts, skip the handle::
+
+    import donglora as dl
+    dl.tx(b"hi")
+    for pkt in dl.rx():
+        ...
+
+Customise anything via :func:`connect` kwargs:
+
+* ``port="/dev/ttyUSB0"`` — explicit serial device
+* ``config=LoRaConfig(...)`` — override the default radio config
+* ``auto_configure=False`` — skip automatic SET_CONFIG
+* ``keepalive=False`` — run your own session-liveness cadence
+
+The full DongLoRa Protocol v2 surface is available via :class:`Dongle` methods
+(:meth:`Dongle.tx` / :meth:`Dongle.rx` / :meth:`Dongle.set_config` /
+:meth:`Dongle.ping` / :attr:`Dongle.info`) and the underlying
+:mod:`donglora.frame` / :mod:`donglora.events` / :mod:`donglora.info`
+modules if you need to speak the wire directly.
+
+See ``firmware/PROTOCOL.md`` for the wire-level specification.
 """
 
-from donglora.client import (
-    HANDSHAKE_TIMEOUT,
-    drain_rx,
-    recv,
-    send,
-    validate,
+from __future__ import annotations
+
+from donglora._top_level import close, recv, rx, tx
+from donglora.commands import (
+    TYPE_GET_INFO,
+    TYPE_PING,
+    TYPE_RX_START,
+    TYPE_RX_STOP,
+    TYPE_SET_CONFIG,
+    TYPE_TX,
 )
-from donglora.codec import cobs_encode, read_frame
 from donglora.connect import (
     DEFAULT_TIMEOUT,
     connect,
@@ -43,101 +61,128 @@ from donglora.discovery import (
     find_port,
     wait_for_device,
 )
-from donglora.protocol import (
-    CMD_TAG_GET_CONFIG,
-    CMD_TAG_GET_MAC,
-    CMD_TAG_PING,
-    CMD_TAG_SET_CONFIG,
-    CMD_TAG_START_RX,
-    CMD_TAG_STOP_RX,
-    CMD_TAG_TRANSMIT,
-    DEFAULT_CONFIG,
-    ERROR_INVALID_CONFIG,
-    ERROR_NO_DISPLAY,
-    ERROR_NOT_CONFIGURED,
-    ERROR_RADIO_BUSY,
-    ERROR_TX_TIMEOUT,
-    MAX_PAYLOAD,
-    PREAMBLE_DEFAULT,
-    RADIO_CONFIG_SIZE,
-    RESP_TAG_CONFIG,
-    RESP_TAG_ERROR,
-    RESP_TAG_MAC_ADDRESS,
-    RESP_TAG_OK,
-    RESP_TAG_PONG,
-    RESP_TAG_RX_PACKET,
-    RESP_TAG_TX_DONE,
-    TX_POWER_MAX,
-    Bandwidth,
+from donglora.dongle import Dongle
+from donglora.errors import (
+    BusyError,
+    Cancelled,
+    ChannelBusy,
+    DeviceError,
+    DongloraError,
     ErrorCode,
-    RadioConfig,
-    decode_config,
-    decode_response,
-    encode_command,
-    encode_config,
+    FrameError,
+    InternalError,
+    LengthError,
+    ModulationError,
+    NotConfiguredError,
+    ParamError,
+    RadioError,
+    TimeoutError_,
+    UnknownCommandError,
+)
+from donglora.events import (
+    Owner,
+    RxEvent,
+    RxOrigin,
+    SetConfigResult,
+    SetConfigResultCode,
+    TxDone,
+    TxResult,
+)
+from donglora.frame import MAX_OTA_PAYLOAD, MAX_PAYLOAD_FIELD, MAX_WIRE_FRAME, Frame, encode_frame
+from donglora.info import MAX_MCU_UID_LEN, MAX_RADIO_UID_LEN, Capability, Info, RadioChipId
+from donglora.modulation import (
+    FlrcBitrate,
+    FlrcBt,
+    FlrcCodingRate,
+    FlrcConfig,
+    FlrcPreambleLen,
+    FskConfig,
+    LoRaBandwidth,
+    LoRaCodingRate,
+    LoRaConfig,
+    LoRaHeaderMode,
+    LrFhssBandwidth,
+    LrFhssCodingRate,
+    LrFhssConfig,
+    LrFhssGrid,
+    Modulation,
+    ModulationId,
 )
 from donglora.transport import MuxConnection
 
 __all__ = [
     "BRIDGE_VID_PIDS",
-    "CMD_TAG_GET_CONFIG",
-    "CMD_TAG_GET_MAC",
-    # tag constants
-    "CMD_TAG_PING",
-    "CMD_TAG_SET_CONFIG",
-    "CMD_TAG_START_RX",
-    "CMD_TAG_STOP_RX",
-    "CMD_TAG_TRANSMIT",
-    "DEFAULT_CONFIG",
-    # connect
     "DEFAULT_TIMEOUT",
-    # error constants
-    "ERROR_INVALID_CONFIG",
-    "ERROR_NOT_CONFIGURED",
-    "ERROR_NO_DISPLAY",
-    "ERROR_RADIO_BUSY",
-    "ERROR_TX_TIMEOUT",
-    # client
-    "HANDSHAKE_TIMEOUT",
-    # protocol
-    "MAX_PAYLOAD",
-    "PREAMBLE_DEFAULT",
-    "RADIO_CONFIG_SIZE",
-    "RESP_TAG_CONFIG",
-    "RESP_TAG_ERROR",
-    "RESP_TAG_MAC_ADDRESS",
-    "RESP_TAG_OK",
-    "RESP_TAG_PONG",
-    "RESP_TAG_RX_PACKET",
-    "RESP_TAG_TX_DONE",
-    "TX_POWER_MAX",
+    "MAX_MCU_UID_LEN",
+    "MAX_OTA_PAYLOAD",
+    "MAX_PAYLOAD_FIELD",
+    "MAX_RADIO_UID_LEN",
+    "MAX_WIRE_FRAME",
+    "TYPE_GET_INFO",
+    "TYPE_PING",
+    "TYPE_RX_START",
+    "TYPE_RX_STOP",
+    "TYPE_SET_CONFIG",
+    "TYPE_TX",
     "USB_PID",
-    # discovery
     "USB_VID",
     "USB_VID_PID",
-    "Bandwidth",
+    "BusyError",
+    "Cancelled",
+    "Capability",
+    "ChannelBusy",
+    "DeviceError",
+    "Dongle",
+    "DongloraError",
     "ErrorCode",
-    # transport
+    "FlrcBitrate",
+    "FlrcBt",
+    "FlrcCodingRate",
+    "FlrcConfig",
+    "FlrcPreambleLen",
+    "Frame",
+    "FrameError",
+    "FskConfig",
+    "Info",
+    "InternalError",
+    "LengthError",
+    "LoRaBandwidth",
+    "LoRaCodingRate",
+    "LoRaConfig",
+    "LoRaHeaderMode",
+    "LrFhssBandwidth",
+    "LrFhssCodingRate",
+    "LrFhssConfig",
+    "LrFhssGrid",
+    "Modulation",
+    "ModulationError",
+    "ModulationId",
     "MuxConnection",
-    "RadioConfig",
-    # codec
-    "cobs_encode",
+    "NotConfiguredError",
+    "Owner",
+    "ParamError",
+    "RadioChipId",
+    "RadioError",
+    "RxEvent",
+    "RxOrigin",
+    "SetConfigResult",
+    "SetConfigResultCode",
+    "TimeoutError_",
+    "TxDone",
+    "TxResult",
+    "UnknownCommandError",
+    "close",
     "connect",
     "connect_default",
     "connect_mux_auto",
-    "decode_config",
-    "decode_response",
     "default_socket_path",
-    "drain_rx",
-    "encode_command",
-    "encode_config",
+    "encode_frame",
     "find_port",
     "mux_connect",
     "mux_tcp_connect",
-    "read_frame",
     "recv",
-    "send",
+    "rx",
     "try_connect",
-    "validate",
+    "tx",
     "wait_for_device",
 ]
