@@ -1,13 +1,48 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-04-22
 
-### Fixed
+The 1.0 Python client, mirroring the Rust client 1.0 API and the
+DongLoRa Protocol v2 wire format.
 
-- Once a mux connection succeeds, all future `connect()` calls in the
-  same process only try the mux (waiting for it to reappear if needed).
-  `try_connect()` raises immediately so callers can retry with backoff.
-  Prevents clients from stealing the serial port during mux restarts.
+### Breaking
+
+- **DongLoRa Protocol v2 wire format** (wire-incompatible with 0.x
+  firmware and clients). All message types, tag correlation, and
+  framing now follow `PROTOCOL.md` v1.0.
+- **Module split.** Monolithic `protocol.py` / `client.py` are replaced
+  with: `dongle.py` (high-level async `Dongle`), `session.py` (reader
+  task, tag routing, keepalive), `frame.py` (streaming `FrameDecoder`
+  + `encode_frame`), `commands.py` / `events.py` / `errors.py` /
+  `modulation.py` / `info.py` / `crc.py`, matching the
+  `donglora-protocol` Rust crate module-for-module.
+- **Async API throughout.** Serial I/O via `asyncio-serial`; mux
+  connections via `asyncio` streams. The blocking client surface is
+  gone.
+- **New error hierarchy.** `DongloraError` base with `Timeout`,
+  `TransportClosed`, `ReaderExited`, `BadFrame`, and `ErrClient...`
+  variants mirroring the Rust client's `ClientError`.
+
+### Added
+
+- Tag-aware dispatch with concurrent in-flight commands. The
+  `TagAllocator` hands out 16-bit device tags; `Session` routes each
+  response back to the originating coroutine.
+- Auto-recovery from `ERR(ENOTCONFIGURED)`. The `Dongle` caches the
+  last `SET_CONFIG` and silently re-applies it on timeout, retrying
+  once.
+- 500 ms background keepalive task per `PROTOCOL.md §3.4`.
+- Sticky mux reconnect: once a mux connection succeeds, all future
+  `connect()` calls in the same process only try the mux (waiting
+  for it to reappear if needed). `try_connect()` raises immediately
+  so callers can retry with backoff. Prevents clients from stealing
+  the serial port during mux restarts.
+
+### Test suite
+
+- New tests: `test_dongle`, `test_session`, `test_frame`, `test_events`,
+  `test_modulation`, `test_crc`, `test_ergonomics`.
+- Removed: `test_client`, `test_protocol` (superseded).
 
 ## 0.2.0 — 2026-04-08
 
