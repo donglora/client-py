@@ -42,6 +42,25 @@ class DongloraError(Exception):
     """Base class for all DongLoRa client errors."""
 
 
+class ConfigNotSupported(DongloraError):
+    """The requested config contains a field the device cannot satisfy.
+
+    Raised client-side, before ``SET_CONFIG`` hits the wire, for fields
+    that are *not* safe to silently auto-adjust:
+
+    * ``freq_hz`` outside the device's reported
+      ``freq_min_hz..freq_max_hz`` — silently shifting 915 MHz to
+      868 MHz (or vice versa) crosses regulatory boundaries.
+    * ``sf`` not in ``supported_sf_bitmap`` — changes airtime and
+      sensitivity in ways the caller needs to know about.
+    * ``bw`` not in ``supported_bw_bitmap`` — same as SF.
+
+    ``tx_power_dbm`` is *not* in this list: it's clamped transparently
+    because "give me max power" returning less than requested is the
+    universally expected behavior.
+    """
+
+
 class FrameError(DongloraError):
     """COBS decode, CRC check, or length check failed on an inbound frame."""
 

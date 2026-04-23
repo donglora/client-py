@@ -99,7 +99,11 @@ class Dongle:
 
     @property
     def config(self) -> Modulation | None:
-        """The most-recently-applied radio config, or ``None`` if none."""
+        """The radio config the device actually stored on the last
+        ``SET_CONFIG`` (including any post-clamp tx_power adjustment
+        that :func:`donglora.connect` performed). ``None`` if no
+        ``SET_CONFIG`` has landed yet.
+        """
         return self._applied_config
 
     def tx(self, data: bytes, *, skip_cad: bool = False, timeout: float = 10.0) -> TxDone:

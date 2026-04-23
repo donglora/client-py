@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0 — 2026-04-23
+
+### Added
+
+- `connect()` now validates and auto-adjusts the requested
+  `LoRaConfig` against the device's advertised caps (`GET_INFO`):
+  - `tx_power_dbm` is silently clamped into
+    `[tx_power_min_dbm, tx_power_max_dbm]`. A clamp is logged at
+    INFO. This keeps `dl.connect(config=my_config)` "just work" on
+    boards with lower PA ceilings (e.g. SX1276 @ 20 dBm vs SX1262
+    @ 22 dBm) without any per-board bookkeeping by the caller.
+  - `freq_hz` outside the device's range, `sf` not in
+    `supported_sf_bitmap`, or `bw` not in `supported_bw_bitmap` now
+    raise :class:`ConfigNotSupported` *before* `SET_CONFIG` hits
+    the wire. Silent shifts here would cross regulatory boundaries
+    or change airtime/sensitivity without the caller noticing.
+  - `Dongle.config` is now populated from `SetConfigResult.current`
+    — the modulation the device actually stored, post-clamp — so
+    callers can inspect what landed.
+- New `ConfigNotSupported` exception (subclass of `DongloraError`),
+  exported at the package root.
+
 ## 1.0.1 — 2026-04-22
 
 ### Fixed

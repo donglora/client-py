@@ -6,15 +6,21 @@ form it:
 1. Finds a DongLoRa USB device (or mux socket if one is available).
 2. Opens the transport at 115200 baud.
 3. Sends ``GET_INFO`` to confirm we're talking DongLoRa Protocol v2.
-4. Applies a sensible default :class:`LoRaConfig` via ``SET_CONFIG``.
+4. Applies a sensible default :class:`LoRaConfig` via ``SET_CONFIG``,
+   auto-clamping ``tx_power_dbm`` against the device's advertised cap
+   and raising :class:`ConfigNotSupported` for out-of-range frequency,
+   spreading factor, or bandwidth.
 5. Spawns a keepalive thread to keep the session alive.
-6. Returns a :class:`Dongle` ready for ``.tx()`` / ``.rx()``.
+6. Returns a :class:`Dongle` ready for ``.tx()`` / ``.rx()``. The
+   actually-applied config (post-clamp) is exposed on
+   :attr:`Dongle.config`.
 
 Every step is overrideable via keyword arguments. See ``connect``'s docstring.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import socket
@@ -25,7 +31,7 @@ import serial
 
 from donglora.discovery import find_port, wait_for_device
 from donglora.dongle import Dongle
-from donglora.errors import DongloraError
+from donglora.errors import ConfigNotSupported, DongloraError
 from donglora.info import Info
 from donglora.modulation import LoRaConfig, Modulation
 from donglora.session import Session
@@ -131,6 +137,67 @@ def _open_transport(port: str | None, timeout: float) -> Any:
     return ser
 
 
+def _prepare_config(info: Info, config: Modulation) -> Modulation:
+    """Validate and auto-adjust *config* against the device's advertised caps.
+
+    Per-field policy:
+
+    * ``tx_power_dbm``: clamped into ``[tx_power_min_dbm, tx_power_max_dbm]``.
+      A clamp is logged at INFO — "give me max power" quietly returning less
+      is the universally-expected behavior and not worth a hard error.
+    * ``freq_hz``: rejected with :class:`ConfigNotSupported` when outside
+      ``[freq_min_hz, freq_max_hz]``. Silently shifting a 915 MHz request
+      to 868 MHz (or vice versa) would cross regulatory boundaries.
+    * ``sf``, ``bw``: rejected with :class:`ConfigNotSupported` when the
+      corresponding capability bit isn't set. These change airtime and
+      sensitivity dramatically; silent substitution is more confusing
+      than helpful.
+
+    Non-LoRa modulations pass through untouched — the firmware rejects
+    unsupported modulation IDs with ``EMODULATION`` on its own.
+    """
+    if not isinstance(config, LoRaConfig):
+        return config
+
+    cfg: LoRaConfig = config
+
+    if not (info.freq_min_hz <= cfg.freq_hz <= info.freq_max_hz):
+        raise ConfigNotSupported(
+            f"frequency {cfg.freq_hz} Hz outside device range "
+            f"[{info.freq_min_hz}, {info.freq_max_hz}] Hz"
+        )
+
+    if not (info.supported_sf_bitmap & (1 << cfg.sf)):
+        supported = [i for i in range(16) if info.supported_sf_bitmap & (1 << i)]
+        raise ConfigNotSupported(
+            f"SF{cfg.sf} not supported by this device (supports SF{supported})"
+        )
+
+    bw_bit = int(cfg.bw)
+    if not (info.supported_bw_bitmap & (1 << bw_bit)):
+        raise ConfigNotSupported(
+            f"bandwidth {cfg.bw.name} (bit {bw_bit}) not in "
+            f"supported_bw_bitmap 0x{info.supported_bw_bitmap:04X}"
+        )
+
+    if cfg.tx_power_dbm > info.tx_power_max_dbm:
+        log.info(
+            "clamping tx_power_dbm: requested %d dBm, device max %d dBm",
+            cfg.tx_power_dbm,
+            info.tx_power_max_dbm,
+        )
+        cfg = dataclasses.replace(cfg, tx_power_dbm=info.tx_power_max_dbm)
+    elif cfg.tx_power_dbm < info.tx_power_min_dbm:
+        log.info(
+            "clamping tx_power_dbm: requested %d dBm, device min %d dBm",
+            cfg.tx_power_dbm,
+            info.tx_power_min_dbm,
+        )
+        cfg = dataclasses.replace(cfg, tx_power_dbm=info.tx_power_min_dbm)
+
+    return cfg
+
+
 def connect(
     port: str | None = None,
     *,
@@ -158,9 +225,16 @@ def connect(
         Modulation to apply at connect-time. Default:
         :meth:`LoRaConfig.default`. Pass ``None`` with
         ``auto_configure=False`` to skip configuration entirely.
+        With ``auto_configure=True`` (default), ``tx_power_dbm`` is
+        silently clamped to the device's ``tx_power_max_dbm`` /
+        ``tx_power_min_dbm``; out-of-range ``freq_hz``, ``sf``, or
+        ``bw`` raise :class:`ConfigNotSupported`. Inspect
+        :attr:`Dongle.config` after connect to see what the device
+        actually stored.
     auto_configure
-        If False, skip the ``SET_CONFIG`` step. The caller is then
-        responsible for calling :meth:`Dongle.set_config` before TX/RX.
+        If False, skip the ``SET_CONFIG`` step entirely — no
+        validation, no clamping. The caller is then responsible for
+        calling :meth:`Dongle.set_config` before TX/RX.
     keepalive
         If False, skip the keepalive daemon thread. The caller is
         responsible for periodic :meth:`Dongle.ping` calls to stay
@@ -195,12 +269,18 @@ def connect(
 
         applied: Modulation | None = None
         if auto_configure:
-            applied = config if config is not None else LoRaConfig.default()
+            requested: Modulation = config if config is not None else LoRaConfig.default()
             try:
-                session.set_config(applied, timeout=max(timeout, 2.0))
+                prepared = _prepare_config(info, requested)
+                result = session.set_config(prepared, timeout=max(timeout, 2.0))
             except DongloraError:
                 session.close()
                 raise
+            # Firmware echoes back the modulation it actually stored. Trust
+            # that rather than our own `prepared` — it's the same value
+            # today, but stays correct if firmware ever adds its own
+            # normalization.
+            applied = result.current if result is not None else prepared
         return session, info, applied
 
     session, info, applied = _open_and_init()
@@ -315,10 +395,11 @@ def _session_on(transport: Any) -> Dongle:
         raise DongloraError(
             f"device speaks DongLoRa Protocol v{info.proto_major}.{info.proto_minor}; this client requires v1.x",
         )
-    applied = LoRaConfig.default()
     try:
-        session.set_config(applied)
+        prepared = _prepare_config(info, LoRaConfig.default())
+        result = session.set_config(prepared)
     except DongloraError:
         session.close()
         raise
+    applied = result.current if result is not None else prepared
     return Dongle(session, info, applied_config=applied, keepalive=True)
