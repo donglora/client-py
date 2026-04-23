@@ -18,7 +18,13 @@ USB_VID: int = 0x1209
 USB_PID: int = 0x5741
 USB_VID_PID: str = "1209:5741"
 
-BRIDGE_VID_PIDS: set[str] = {"10c4:ea60", "1a86:55d4", "1a86:7523", "0403:6001"}
+BRIDGE_VID_PIDS: set[str] = {
+    "10c4:ea60",  # CP2102 (Silicon Labs)
+    "1a86:55d4",  # CH9102
+    "1a86:7522",  # CH340K — Elecrow ThinkNode-M2 ships with this
+    "1a86:7523",  # CH340
+    "0403:6001",  # FT232R (FTDI)
+}
 """Known USB-UART bridge VID:PIDs found on some board revisions."""
 
 

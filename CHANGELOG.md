@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-04-22
+
+### Fixed
+
+- `discovery.find_port` / `wait_for_device` now match the WCH CH340K
+  USB-UART bridge (`1a86:7522`) in `BRIDGE_VID_PIDS`. The Elecrow
+  ThinkNode-M2 board ships with a CH340K bridge; the previous set
+  covered CP2102, CH9102, standard CH340, and FTDI but missed this
+  specific revision, so `discovery` returned `None` on that board.
+
 ## 1.0.0 — 2026-04-22
 
 The 1.0 Python client, mirroring the Rust client 1.0 API and the
